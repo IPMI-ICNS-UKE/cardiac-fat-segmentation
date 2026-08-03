@@ -223,3 +223,5 @@ data/*
 
 output/*
 !output/README.md
+
+.DS_Store
