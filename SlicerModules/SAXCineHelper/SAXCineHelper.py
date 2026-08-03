@@ -28,7 +28,12 @@ class SAXCineHelper(ScriptedLoadableModule):
             "3. Play the 4D sequence, note ED frame (largest LV) and ES frame (smallest LV).\n"
             "4. Click 'Prepare ED/ES segmentations'.\n"
             "5. Annotate Perikard and Epikard in Segment Editor for both frames.\n"
-            "6. Enter patient ID and output directory, click 'Save outputs'."
+            "6. Enter patient ID and output directory, click 'Save outputs'.\n"
+            "\n"
+            "For QC review of an existing case:\n"
+            "7. Point to the case folder, click 'Load ED + ES MRI and segmentations'.\n"
+            "8. Correct in Segment Editor.\n"
+            "9. Click 'Save corrections back to the same files'."
         )
 
 
@@ -112,6 +117,36 @@ class SAXCineHelperWidget(ScriptedLoadableModuleWidget):
         self.saveButton.connect("clicked()", self.onSave)
         l3.addRow(self.saveButton)
 
+        # --- Section 4: Review existing case ------------------------
+        box4 = ctk.ctkCollapsibleButton()
+        box4.text = "4. Load existing case for review"
+        self.layout.addWidget(box4)
+        l4 = qt.QFormLayout(box4)
+
+        self.reviewDirButton = ctk.ctkDirectoryButton()
+        self.reviewDirButton.toolTip = (
+            "Folder containing the NIfTI files for one patient."
+        )
+        l4.addRow("Case folder:", self.reviewDirButton)
+
+        self.reviewPatientIdEdit = qt.QLineEdit()
+        self.reviewPatientIdEdit.placeholderText = (
+            "leave empty to auto-detect from filenames"
+        )
+        l4.addRow("Patient ID:", self.reviewPatientIdEdit)
+
+        self.loadReviewButton = qt.QPushButton(
+            "Load ED + ES MRI and segmentations"
+        )
+        self.loadReviewButton.connect("clicked()", self.onLoadReview)
+        l4.addRow(self.loadReviewButton)
+
+        self.saveReviewButton = qt.QPushButton(
+            "Save corrections back to the same files"
+        )
+        self.saveReviewButton.connect("clicked()", self.onSaveReview)
+        l4.addRow(self.saveReviewButton)
+
         self.layout.addStretch(1)
 
     # ----- callbacks ----------------------------------------------
@@ -124,7 +159,6 @@ class SAXCineHelperWidget(ScriptedLoadableModuleWidget):
             )
             self.edFrameSpin.maximum = n_frames - 1
             self.esFrameSpin.maximum = n_frames - 1
-            # Try to pre-fill patient ID from DICOM
             pid = self.logic.guessPatientId()
             if pid and not self.patientIdEdit.text:
                 self.patientIdEdit.text = pid
@@ -159,6 +193,37 @@ class SAXCineHelperWidget(ScriptedLoadableModuleWidget):
         except Exception as e:
             slicer.util.errorDisplay(f"Save failed:\n{e}")
 
+    def onLoadReview(self):
+        try:
+            pid = self.logic.loadCaseForReview(
+                self.reviewDirButton.directory,
+                self.reviewPatientIdEdit.text.strip() or None,
+            )
+            self.reviewPatientIdEdit.text = pid
+            slicer.util.infoDisplay(
+                f"Loaded case {pid}. Open Segment Editor to make corrections.\n\n"
+                "Switch the source volume between SAX_ED and SAX_ES to edit "
+                "the corresponding segmentation."
+            )
+        except Exception as e:
+            slicer.util.errorDisplay(f"Loading failed:\n{e}")
+
+    def onSaveReview(self):
+        try:
+            pid = self.reviewPatientIdEdit.text.strip()
+            if not slicer.util.confirmYesNoDisplay(
+                f"Overwrite existing segmentations for {pid or '<no ID>'}?"
+            ):
+                return
+            paths = self.logic.saveCorrections(
+                self.reviewDirButton.directory, pid
+            )
+            slicer.util.infoDisplay(
+                "Corrections saved:\n" + "\n".join(os.path.basename(p) for p in paths)
+            )
+        except Exception as e:
+            slicer.util.errorDisplay(f"Save failed:\n{e}")
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Logic
@@ -170,6 +235,8 @@ class SAXCineHelperLogic(ScriptedLoadableModuleLogic):
     BROWSER_NAME = "SAX_4D_browser"
     ED_SEG_NAME = "SAX_ED_segmentation"
     ES_SEG_NAME = "SAX_ES_segmentation"
+    ED_VOL_NAME = "SAX_ED"
+    ES_VOL_NAME = "SAX_ES"
 
     # ----- stacking ----------------------------------------------
     def stackSAXSequences(self):
@@ -187,18 +254,15 @@ class SAXCineHelperLogic(ScriptedLoadableModuleLogic):
                 "(Edit → Application Settings → DICOM)."
             )
 
-        # Sort by b-number, then verify against actual slice origin
         def bnum(seq):
             m = re.search(r"_b(\d+)", seq.GetName())
             return int(m.group(1))
         sax.sort(key=bnum)
-        # Verify spatial monotonicity along slice normal
         self._verify_or_resort_by_origin(sax)
 
         n_frames = sax[0].GetNumberOfDataNodes()
         n_slices = len(sax)
 
-        # Build 4D sequence
         out_seq = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLSequenceNode", self.FOURD_NAME
         )
@@ -218,20 +282,17 @@ class SAXCineHelperLogic(ScriptedLoadableModuleLogic):
             vol.CreateDefaultDisplayNodes()
             out_seq.SetDataNodeAtValue(vol, str(f))
 
-        # Sequence browser so they can scrub/play
         browser = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLSequenceBrowserNode", self.BROWSER_NAME
         )
         browser.AddSynchronizedSequenceNode(out_seq)
         slicer.modules.sequences.toolBar().setActiveBrowserNode(browser)
 
-        # Show the first frame in slice views
         slicer.util.setSliceViewerLayers(
             background=slicer.util.getNode(f"{self.FRAME_VOL_PREFIX}00"),
             fit=True,
         )
 
-        # Clean up original imports
         self._remove_original_imports()
         return n_slices, n_frames
 
@@ -322,8 +383,6 @@ class SAXCineHelperLogic(ScriptedLoadableModuleLogic):
         """Set the Segment Editor's 'Modify other segments' to 'Allow overlap'."""
         editor_nodes = slicer.util.getNodesByClass("vtkMRMLSegmentEditorNode")
         if not editor_nodes:
-            # No editor node yet — create a singleton so the Segment Editor
-            # picks it up when the radiologist opens the module.
             node = slicer.vtkMRMLSegmentEditorNode()
             node.SetSingletonTag("SegmentEditor")
             node = slicer.mrmlScene.AddNode(node)
@@ -398,6 +457,132 @@ class SAXCineHelperLogic(ScriptedLoadableModuleLogic):
         sitk_imgs = [sitkUtils.PullVolumeFromSlicer(v) for v in frame_nodes]
         img_4d = sitk.JoinSeries(sitk_imgs)
         sitk.WriteImage(img_4d, path)
+
+    # ----- review workflow ---------------------------------------
+    def loadCaseForReview(self, case_dir, patient_id=None):
+        """Load ED+ES MRI and their segmentations for QC review."""
+        if not case_dir or not os.path.isdir(case_dir):
+            raise ValueError(f"Case folder does not exist: {case_dir}")
+
+        if not patient_id:
+            patient_id = self._detect_patient_id(case_dir)
+            if not patient_id:
+                raise ValueError(
+                    "Could not auto-detect patient ID. "
+                    "Please enter it manually."
+                )
+
+        expected = {
+            "ed_mri": f"{patient_id}_3D_ED_MRI.nii.gz",
+            "es_mri": f"{patient_id}_3D_ES_MRI.nii.gz",
+            "ed_seg": f"{patient_id}_3D_ED_segmentation.nii.gz",
+            "es_seg": f"{patient_id}_3D_ES_segmentation.nii.gz",
+        }
+        paths = {k: os.path.join(case_dir, v) for k, v in expected.items()}
+        missing = [expected[k] for k in expected if not os.path.isfile(paths[k])]
+        if missing:
+            raise RuntimeError(
+                "Missing expected files:\n" + "\n".join(missing)
+            )
+
+        self._clear_review_nodes()
+
+        ed_vol = slicer.util.loadVolume(paths["ed_mri"])
+        ed_vol.SetName(self.ED_VOL_NAME)
+        es_vol = slicer.util.loadVolume(paths["es_mri"])
+        es_vol.SetName(self.ES_VOL_NAME)
+
+        self._load_labelmap_as_segmentation(
+            paths["ed_seg"], self.ED_SEG_NAME, ed_vol
+        )
+        self._load_labelmap_as_segmentation(
+            paths["es_seg"], self.ES_SEG_NAME, es_vol
+        )
+
+        slicer.util.setSliceViewerLayers(background=ed_vol, fit=True)
+
+        self._configure_allow_overlap()
+
+        return patient_id
+
+    def _detect_patient_id(self, case_dir):
+        """Infer patient ID from files matching '*_3D_ED_MRI.nii.gz'."""
+        for f in os.listdir(case_dir):
+            m = re.match(r"(.+)_3D_ED_MRI\.nii\.gz$", f)
+            if m:
+                return m.group(1)
+        return None
+
+    def _load_labelmap_as_segmentation(self, path, seg_name, ref_vol):
+        """Load a labelmap NIfTI and convert it to a segmentation node
+        with named segments Perikard (1) and Epikard (2)."""
+        labelmap = slicer.util.loadLabelVolume(path)
+
+        seg = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode", seg_name
+        )
+        seg.CreateDefaultDisplayNodes()
+        seg.SetReferenceImageGeometryParameterFromVolumeNode(ref_vol)
+
+        ok = slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+            labelmap, seg
+        )
+        if not ok:
+            raise RuntimeError(f"Failed to import labelmap: {path}")
+
+        # Rename segments and set colors to match the annotation convention.
+        # Label 1 → Perikard, Label 2 → Epikard.
+        segmentation = seg.GetSegmentation()
+        segment_ids = vtk.vtkStringArray()
+        segmentation.GetSegmentIDs(segment_ids)
+        for i in range(segment_ids.GetNumberOfValues()):
+            seg_id = segment_ids.GetValue(i)
+            segment = segmentation.GetSegment(seg_id)
+            if i == 0:
+                segment.SetName("Perikard")
+                segment.SetColor(0.95, 0.35, 0.35)
+            elif i == 1:
+                segment.SetName("Epikard")
+                segment.SetColor(0.35, 0.65, 0.95)
+
+        slicer.mrmlScene.RemoveNode(labelmap)
+
+    def _clear_review_nodes(self):
+        """Remove any previously loaded review case so a fresh load is clean."""
+        for name in (self.ED_VOL_NAME, self.ES_VOL_NAME):
+            n = slicer.mrmlScene.GetFirstNodeByName(name)
+            if n:
+                slicer.mrmlScene.RemoveNode(n)
+        for name in (self.ED_SEG_NAME, self.ES_SEG_NAME):
+            n = slicer.mrmlScene.GetFirstNodeByName(name)
+            if n:
+                slicer.mrmlScene.RemoveNode(n)
+
+    def saveCorrections(self, case_dir, patient_id):
+        """Overwrite the two segmentation NIfTIs with the current edits."""
+        if not patient_id:
+            raise ValueError("Patient ID is empty.")
+        if not case_dir or not os.path.isdir(case_dir):
+            raise ValueError(f"Case folder does not exist: {case_dir}")
+
+        ed_vol = slicer.mrmlScene.GetFirstNodeByName(self.ED_VOL_NAME)
+        es_vol = slicer.mrmlScene.GetFirstNodeByName(self.ES_VOL_NAME)
+        ed_seg = slicer.mrmlScene.GetFirstNodeByName(self.ED_SEG_NAME)
+        es_seg = slicer.mrmlScene.GetFirstNodeByName(self.ES_SEG_NAME)
+        if not all([ed_vol, es_vol, ed_seg, es_seg]):
+            raise RuntimeError(
+                "Review case not loaded. Click 'Load ED + ES MRI...' first."
+            )
+
+        ed_path = os.path.join(
+            case_dir, f"{patient_id}_3D_ED_segmentation.nii.gz"
+        )
+        es_path = os.path.join(
+            case_dir, f"{patient_id}_3D_ES_segmentation.nii.gz"
+        )
+        self._save_segmentation(ed_seg, ed_vol, ed_path)
+        self._save_segmentation(es_seg, es_vol, es_path)
+        return [ed_path, es_path]
 
     # ----- helpers ------------------------------------------------
     def guessPatientId(self):
