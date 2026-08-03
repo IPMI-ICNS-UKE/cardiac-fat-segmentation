@@ -74,6 +74,15 @@ class SAXCineHelperWidget(ScriptedLoadableModuleWidget):
         self.esFrameSpin.value = 9
         l2.addRow("ES frame index:", self.esFrameSpin)
 
+        self.allowOverlapCheck = qt.QCheckBox("Allow overlapping segments")
+        self.allowOverlapCheck.checked = True
+        self.allowOverlapCheck.toolTip = (
+            "Sets the Segment Editor's 'Modify other segments' to "
+            "'Allow overlap' so Perikard and Epikard can be nested "
+            "without erasing each other."
+        )
+        l2.addRow(self.allowOverlapCheck)
+
         self.prepareButton = qt.QPushButton(
             "Create empty segmentations for these frames"
         )
@@ -125,7 +134,9 @@ class SAXCineHelperWidget(ScriptedLoadableModuleWidget):
     def onPrepare(self):
         try:
             self.logic.prepareSegmentations(
-                self.edFrameSpin.value, self.esFrameSpin.value
+                self.edFrameSpin.value,
+                self.esFrameSpin.value,
+                allow_overlap=self.allowOverlapCheck.checked,
             )
             slicer.util.infoDisplay(
                 "Empty ED and ES segmentations created with 'Perikard' "
@@ -226,7 +237,6 @@ class SAXCineHelperLogic(ScriptedLoadableModuleLogic):
 
     def _verify_or_resort_by_origin(self, sax):
         """If b-number order doesn't match spatial order, re-sort by origin."""
-        # Project each slice's origin onto its own normal (column 2 of IJK->RAS)
         ref = sax[0]
         m = vtk.vtkMatrix4x4()
         ref.GetNthDataNode(0).GetIJKToRASMatrix(m)
@@ -241,7 +251,6 @@ class SAXCineHelperLogic(ScriptedLoadableModuleLogic):
         if positions != sorted(positions) and positions != sorted(
             positions, reverse=True
         ):
-            # Non-monotonic b-numbering → re-sort
             order = np.argsort(positions)
             sax[:] = [sax[i] for i in order]
 
@@ -264,7 +273,7 @@ class SAXCineHelperLogic(ScriptedLoadableModuleLogic):
         return m
 
     def _remove_original_imports(self):
-        # Remove original SAX sequences, their proxy volumes, and orphan browsers
+        """Remove original SAX sequences, their proxy volumes, and orphan browsers."""
         kept_names = {self.FOURD_NAME}
         for n in list(slicer.util.getNodesByClass("vtkMRMLSequenceNode")):
             if n.GetName() not in kept_names and (
@@ -285,12 +294,11 @@ class SAXCineHelperLogic(ScriptedLoadableModuleLogic):
                     slicer.mrmlScene.RemoveNode(n)
 
     # ----- segmentations -----------------------------------------
-    def prepareSegmentations(self, ed_frame, es_frame):
+    def prepareSegmentations(self, ed_frame, es_frame, allow_overlap=True):
         for name, frame in (
             (self.ED_SEG_NAME, ed_frame),
             (self.ES_SEG_NAME, es_frame),
         ):
-            # Remove if it already exists (e.g. user re-prepares)
             existing = slicer.mrmlScene.GetFirstNodeByName(name)
             if existing:
                 slicer.mrmlScene.RemoveNode(existing)
@@ -305,6 +313,24 @@ class SAXCineHelperLogic(ScriptedLoadableModuleLogic):
             )
             seg.GetSegmentation().AddEmptySegment(
                 "Epikard", "Epikard", [0.35, 0.65, 0.95]
+            )
+
+        if allow_overlap:
+            self._configure_allow_overlap()
+
+    def _configure_allow_overlap(self):
+        """Set the Segment Editor's 'Modify other segments' to 'Allow overlap'."""
+        editor_nodes = slicer.util.getNodesByClass("vtkMRMLSegmentEditorNode")
+        if not editor_nodes:
+            # No editor node yet — create a singleton so the Segment Editor
+            # picks it up when the radiologist opens the module.
+            node = slicer.vtkMRMLSegmentEditorNode()
+            node.SetSingletonTag("SegmentEditor")
+            node = slicer.mrmlScene.AddNode(node)
+            editor_nodes = [node]
+        for node in editor_nodes:
+            node.SetOverwriteMode(
+                slicer.vtkMRMLSegmentEditorNode.OverwriteNone
             )
 
     # ----- save ---------------------------------------------------
@@ -380,7 +406,6 @@ class SAXCineHelperLogic(ScriptedLoadableModuleLogic):
             db = slicer.dicomDatabase
             patients = db.patients()
             if patients:
-                # Returns internal UID; for the human-readable ID use a study
                 studies = db.studiesForPatient(patients[0])
                 if studies:
                     series = db.seriesForStudy(studies[0])
