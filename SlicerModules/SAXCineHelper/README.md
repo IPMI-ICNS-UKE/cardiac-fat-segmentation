@@ -18,13 +18,6 @@ position, each containing all 25 cardiac phases. This module:
    and correction, with segmentations restored as editable overlays
    on the corresponding MRIs.
 
-## Requirements
-
-- [3D Slicer](https://slicer.org) 5.4 or newer
-- SAX cine data imported as **Volume Sequence** (not MultiVolume). Set
-  this in *Edit → Application Settings → DICOM → Preferred multi-volume
-  import format*, then restart Slicer.
-
 ## Installation
 
 1. Clone or download this repository.
