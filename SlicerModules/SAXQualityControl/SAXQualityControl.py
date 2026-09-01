@@ -104,6 +104,21 @@ class SAXQualityControlWidget(ScriptedLoadableModuleWidget):
         seg_row.addWidget(self.segBrowseButton)
         l2.addRow("Folder:", seg_row)
 
+        self.nestedContourCheck = qt.QCheckBox(
+            "Reconstruct nested contours (Perikard ⊇ Epikard)"
+        )
+        self.nestedContourCheck.checked = True
+        self.nestedContourCheck.toolTip = (
+            "The segmentations produced by SAXCineHelper use overlapping, "
+            "nested contours: Perikard fully contains Epikard. NIfTI "
+            "labelmaps can only store one label per voxel, so on reload "
+            "Perikard would otherwise appear as only the fat ring. This "
+            "option restores the nested convention. Uncheck for "
+            "segmentations from other tools where segments should not "
+            "overlap."
+        )
+        l2.addRow(self.nestedContourCheck)
+
         self.loadSegButton = qt.QPushButton("Load segmentation")
         self.loadSegButton.connect("clicked()", self.onLoadSegmentation)
         l2.addRow(self.loadSegButton)
@@ -244,7 +259,10 @@ class SAXQualityControlWidget(ScriptedLoadableModuleWidget):
             slicer.util.errorDisplay(f"Folder does not exist:\n{folder}")
             return
         try:
-            info = self.logic.loadSegmentation(folder)
+            info = self.logic.loadSegmentation(
+                folder,
+                reconstruct_nested=self.nestedContourCheck.checked,
+            )
             ed_vol = slicer.mrmlScene.GetFirstNodeByName(
                 self.logic.ED_VOL_NAME
             )
@@ -254,9 +272,13 @@ class SAXQualityControlWidget(ScriptedLoadableModuleWidget):
                 f" ({len(info['labels'])} labels)"
                 if info["csv"] else " (no labels.csv found — used defaults)"
             )
+            nesting_note = (
+                "\nNested contours reconstructed."
+                if self.nestedContourCheck.checked else ""
+            )
             self.segStatusLabel.setPlainText(
                 f"Loaded {os.path.basename(info['nifti'])}{labels_note}\n"
-                f"from: {folder}"
+                f"from: {folder}{nesting_note}"
             )
         except Exception as e:
             slicer.util.errorDisplay(f"Loading failed:\n{e}")
@@ -556,7 +578,7 @@ class SAXQualityControlLogic(ScriptedLoadableModuleLogic):
                 slicer.mrmlScene.RemoveNode(n)
 
     # ----- segmentation loading ----------------------------------
-    def loadSegmentation(self, folder):
+    def loadSegmentation(self, folder, reconstruct_nested=True):
         if not os.path.isdir(folder):
             raise ValueError(f"Not a folder: {folder}")
 
@@ -609,6 +631,9 @@ class SAXQualityControlLogic(ScriptedLoadableModuleLogic):
                 raise RuntimeError(f"Failed to import labelmap: {nifti_path}")
 
             self._apply_labels(seg, labels_dict)
+
+            if reconstruct_nested:
+                self._reconstruct_nested_contours(seg)
         finally:
             slicer.mrmlScene.RemoveNode(labelmap)
 
@@ -691,6 +716,48 @@ class SAXQualityControlLogic(ScriptedLoadableModuleLogic):
             segment.SetName(info["name"])
             if info.get("color"):
                 segment.SetColor(*info["color"])
+
+    def _reconstruct_nested_contours(self, seg_node):
+        """After loading a labelmap where inner segments overwrote outer ones,
+        reconstruct the nested-contour convention: each segment (starting
+        from the outermost / lowest label) is unioned with all segments
+        below it in the label ordering.
+
+        Assumes the annotation convention used by SAXCineHelper: segments
+        are ordered outer-to-inner (Perikard = label 1, Epikard = label 2)
+        and each outer segment fully contains the inner ones.
+        """
+        segmentation = seg_node.GetSegmentation()
+        seg_ids = vtk.vtkStringArray()
+        segmentation.GetSegmentIDs(seg_ids)
+        n = seg_ids.GetNumberOfValues()
+        if n < 2:
+            return
+
+        ref_vol = slicer.mrmlScene.GetFirstNodeByName(self.ED_VOL_NAME)
+        if ref_vol is None:
+            return
+
+        ids = [seg_ids.GetValue(i) for i in range(n)]
+
+        # Snapshot every mask BEFORE modifying any of them
+        masks = [
+            slicer.util.arrayFromSegmentBinaryLabelmap(
+                seg_node, sid, ref_vol
+            ) > 0
+            for sid in ids
+        ]
+
+        # Segment i absorbs segments i+1 .. n-1
+        for i in range(n - 1):  # last segment (innermost) is left as-is
+            union_mask = masks[i].copy()
+            for j in range(i + 1, n):
+                union_mask |= masks[j]
+            if not np.array_equal(union_mask, masks[i]):
+                slicer.util.updateSegmentBinaryLabelmapFromArray(
+                    union_mask.astype(np.uint8),
+                    seg_node, ids[i], ref_vol,
+                )
 
     # ----- NIfTI save (4D + 3D ED) -------------------------------
     def saveNiftiVolumes(self):
@@ -834,4 +901,3 @@ class SAXQualityControlLogic(ScriptedLoadableModuleLogic):
             )
             writer.writeheader()
             writer.writerows(rows)
-            
