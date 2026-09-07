@@ -225,3 +225,7 @@ output/*
 !output/README.md
 
 .DS_Store
+.vscode
+
+literature/*
+!literature/README.md
