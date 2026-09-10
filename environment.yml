@@ -9,3 +9,7 @@ dependencies:
   - openpyxl
   - nibabel
   - matplotlib
+  - pandas
+  - seaborn
+  - scipy
+  - plotly
