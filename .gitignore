@@ -229,3 +229,12 @@ output/*
 
 literature/*
 !literature/README.md
+
+nnUNet_baseline/nnUNet_raw/*
+!nnUNet_baseline/nnUNet_raw/README.md
+
+nnUNet_baseline/nnUNet_preprocessed/*
+!nnUNet_baseline/nnUNet_preprocessed/README.md
+
+nnUNet_baseline/nnUNet_results/*
+!nnUNet_baseline/nnUNet_results/README.md
